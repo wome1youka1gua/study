@@ -12,6 +12,7 @@ import numpy as np
 import time
 import torch
 
+from mlp import create_nerf
 from load import load_blender_data
 from rays import get_rays_np, render
 from tqdm import tqdm, trange
@@ -33,6 +34,9 @@ def config_parser():
     parser.add_argument("--half_res", action='store_true',  # 只加载一半分辨率的图片，要不然爆显存了
                         help='原图是800*800的，只加载一半分辨率，400*400')
 
+    parser.add_argument("--white_bkgd", action='store_true',
+                        help='设置为在白色背景上渲染合成数据')
+
     # 给xyz坐标编码的设置 # 就是编码的指数最高是几 编码编到 multires-1 (sin(x), cos(x). sin(2x), cos(2x), ..., sin(2^9x), cos(2^9x))
     parser.add_argument("--multires", type=int, default=10,
                         help='给坐标编码编几层')
@@ -40,14 +44,53 @@ def config_parser():
     parser.add_argument("--multires_views", type=int, default=4,
                         help='给视角编码编几层')
 
-    parser.add_argument("--N_rand", type=int, default=32 * 32 * 4,  # 一轮训练中训练的光线（像素点）的数量，太大了可能会爆显存，可以调
+    parser.add_argument("--netdepth", type=int, default=8,  # 粗网络的层数
+                        help='粗网络的层数')
+
+    parser.add_argument("--netwidth", type=int, default=256,  # 粗网络每一层神经元的个数
+                        help='每一层神经元的个数')
+
+    parser.add_argument("--netdepth_fine", type=int, default=8,  # 精细网络的层数
+                        help='layers in fine network')
+
+    parser.add_argument("--netwidth_fine", type=int, default=256,  # 精细网络每一层神经元的个数
+                        help='channels per layer in fine network')
+
+    parser.add_argument("--N_rand", type=int, default=32 * 32 * 2,  # 一轮训练中训练的光线（像素点）的数量，太大了可能会爆显存，可以调
                         help='一轮训练中训练的光线（像素点）的数量')
+
+    parser.add_argument("--N_samples", type=int, default=64,  # 每条射线的粗样本数
+                        help='每条粗采样光线上的采样点数量')
+
+    parser.add_argument("--N_importance", type=int, default=192,  # 每条射线附加的细样本数 密度大的地方多采几个点
+                        help='每条射线附加的细样本数')
+
+    parser.add_argument("--netchunk", type=int, default=32 * 32 * 4,  # 一次向网络里塞这么多点
+                        help='网络中并行发送的点数，如果溢出则减少')
+
+    parser.add_argument("--chunk", type=int, default=32 * 32 * 4 * 8,  # 一批处理的光线数量
+                        help='一批处理的光线数量')
+
+    parser.add_argument("--lrate", type=float, default=5e-4,  # 学习率
+                        help='学习率')
+
+    parser.add_argument("--lrate_decay", type=int, default=250,  # 指数学习率衰减
+                        help='指数学习率衰减')
+
+    parser.add_argument("--raw_noise_std", type=float, default=0.,  # 噪音方差
+                        help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
+
+    parser.add_argument("--perturb", type=float, default=1.,  # 采样光线上的采样点是否要抖动
+                        help='采样光线上的采样点是否要抖动')
+
 
     return parser
 
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == torch.device('cuda'):
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
     print('正在使用', device)
     np.random.seed(0)
 
@@ -119,6 +162,19 @@ def train():
     N_rand = args.N_rand  # 获取每一轮训练中训练的光线数量
     i_batch = 0  # 用来统计训练中总共获取到的光线的数量
 
+    # 创建NeRF网络模型
+    # 1.训练要的东西 包括网络和扰动等参数 2.测试要的东西 3.检查点，练到第几轮了 4.模型中的可训练参数 5.可训练参数的优化器
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(device, args)
+    global_step = start
+
+    # 再把渲染距离区间添加到训练和测试要的东西里
+    bds_dict = {
+        'near': near,
+        'far': far,
+    }
+    render_kwargs_train.update(bds_dict)
+    render_kwargs_test.update(bds_dict)
+
     # step开始训练
     for i in trange(0, 1):
         time_start = time.time()  # 统计每轮时间
@@ -141,7 +197,7 @@ def train():
             i_batch = 0
 
         # 把光线送到模型中预测
-        render(batch_rays)
+        render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
 
 
 

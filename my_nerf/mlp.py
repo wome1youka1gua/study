@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import rearrange, reduce, repeat
+
 
 # 编码器类
 class Embedder:
@@ -110,15 +112,18 @@ class NeRFNetwork(nn.Module):
         :param x: 像素坐标和视角
         :return:
         """
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_view], dim=0)  # TODO 我觉得这个x应该就是一个一维张量，所以dim为0也没问题，原来的代码是-1
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_view], dim=-1)  # TODO 我觉得这个x应该就是一个一维张量，所以dim为0也没问题，原来的代码是-1
+        print('input_pts.shape', input_pts.shape)
+        print('input_views.shape', input_views.shape)
 
         hide_output = input_pts
         for i, linear in enumerate(self.pts_linears):
             hide_output = linear(hide_output)
             hide_output = F.relu(hide_output)
+            print('number', i, ' hide_output.shape', hide_output.shape)
 
             if i in self.skip:
-                hide_output = torch.cat([input_pts, hide_output], dim=0)
+                hide_output = torch.cat([input_pts, hide_output], dim=-1)
 
         # 计算密度
         sigma = self.sigma_linear(hide_output)
@@ -146,25 +151,107 @@ class NeRFNetwork(nn.Module):
         torch.nn.init.normal_(self.rgb_linear.weight, mean=0, std=1)
 
 
-def create_nerf(args):
+def batchify(model, chunk, inputs):
+    """
+
+    :param model:
+    :param chunk:
+    :param inputs: [N_rand * N_samples, 63 + 27]
+    :return:
+    """
+    outputs = torch.cat([model(inputs[i:i + chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+    return outputs
+
+
+def run_network(pts, view_dirs, model, embed_fn, embeddirs_fn, net_chunk=32 * 32 * 4 * 8 * 2):
+    """
+    将坐标和视角送入mlp，获得预测的颜色和密度
+    :param pts: [N_rand, N_samples, 3] 采样光线上的采样点的坐标
+    :param view_dirs: [N_rand, 3] 视角向量
+    :param model: 网络模型
+    :param embed_fn: 给坐标编码的函数
+    :param embeddirs_fn: 给视角编码的函数
+    :param net_chunk: 让mlp网络一次处理的点的数量
+    :return:
+    """
+    # 获得编码后的坐标
+    input_pts_flat = rearrange(pts, 'n n1 d -> (n n1) d', d=3)  # [N_rand * N_samples, 3]
+    embedded_pts = embed_fn(input_pts_flat)  # [N_rand * N_samples, 63]
+    print('embedded_pts.shape', embedded_pts.shape)
+    print('embedded_pts[0].shape', embedded_pts[0].shape)
+
+    # 获得编码后的视角
+    input_view_dirs = rearrange(view_dirs, 'n d -> n 1 d', d=3)
+    input_view_dirs_flat = repeat(input_view_dirs, 'n n1 d -> n (repeat n1) d', repeat=pts.shape[1], d=3)  # [N_rand, N_samples, 3]
+    input_view_dirs_flat = rearrange(input_view_dirs_flat, 'n n1 d -> (n n1) d', d=3)
+    embedded_dirs = embeddirs_fn(input_view_dirs_flat)  # [N_rand * N_samples, 27]
+    print('embedded_dirs.shape', embedded_dirs.shape)
+    print('embedded_dirs[0].shape', embedded_dirs[0].shape)
+
+    # 编码后的坐标和视角
+    embedded = torch.cat([embedded_pts, embedded_dirs], -1)  # [N_rand * N_samples, 63 + 27]
+
+    # 用网络获取输出
+    rgba_flat = batchify(model=model, chunk=net_chunk, inputs=embedded)
+    rgba = torch.reshape(rgba_flat, list(pts.shape[:-1]) + [rgba_flat.shape[-1]])
+    # TODO 这俩好像是一样的
+    print('rgba_flat.shape, rgba.shape', rgba_flat.shape, rgba.shape)
+
+    return rgba
+
+
+
+
+
+def create_nerf(device, args):
     # step 获取坐标的编码函数 以及 编码后的坐标的维度
     embed_fn, input_ch = get_embedder(args.multires)
 
     # step 获取视角的编码函数 以及 编码后的视角的维度
-    embed_dir_fn, input_ch_views = get_embedder(args.multires_views)
+    embeddirs_fn, input_ch_views = get_embedder(args.multires_views)
 
     # step 初始化mlp网络 粗网络和精细网络
     grad_vars = list()  # 用来存储两个
     skip = [4]
 
     # step 创建mlp网络 需要创建一个粗网络和一个精细网络 以及获取网络中的权重和偏置
-    model = NeRFNetwork()  # 粗网络
+    model = NeRFNetwork(D=args.netdepth, W=args.netwidth, input_ch=input_ch, input_ch_view=input_ch_views, skip=skip).to(device)  # 粗网络
     grad_vars = list(model.parameters())  # 获取网络中可训练的参数 weight和bias
-    model_fine = NeRFNetwork()  # 精细网络 实际上和粗网络长得一样
-    grad_vars.append(model_fine.parameters())
+    model_fine = NeRFNetwork(D=args.netdepth, W=args.netwidth, input_ch=input_ch, input_ch_view=input_ch_views, skip=skip).to(device)  # 精细网络 实际上和粗网络长得一样
+    grad_vars += list(model_fine.parameters())  # model.parameters() 是一个generator 得先转成list 每一层的权重torch.Size([256, 3]) 偏置torch.Size([256])
 
-    # step 创建一个查询网络，输入为
+    # step 创建一个查询网络，输入为 点的坐标和视角 输出为 这个点的颜色和密度
+    # 写成匿名函数应该是为了用的时候少传点参数，这样只用传三个参数就行
+    network_query_fn = lambda inputs, viewdirs, network_fn: run_network(inputs, viewdirs, network_fn,
+                                                                        embed_fn=embed_fn,
+                                                                        embeddirs_fn=embeddirs_fn,
+                                                                        net_chunk=args.netchunk)  # 网络批处理查询点的数量 应该就是一次处理多少个点
 
+    # 创建优化器
+    optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+
+    # 获取到了所有需要的参数 训练 和 测试
+    # 训练
+    render_kwargs_train = {
+        'model': model,  # 模型
+        'model_fine': model_fine,  # 精细模型
+        'network_query_fn': network_query_fn,  # 到时候要获取某个点的颜色和密度就用这个 传进去坐标 视角 模型
+        'white_bkgd': args.white_bkgd,
+        'N_samples': args.N_samples,
+        'N_importance': args.N_importance,
+        'perturb': args.perturb,
+        'raw_noise_std': args.raw_noise_std
+    }
+
+    # 测试
+    render_kwargs_test = {k: render_kwargs_train[k] for k in render_kwargs_train}
+    render_kwargs_test['perturb'] = False
+    render_kwargs_test['raw_noise_std'] = 0.
+
+    # 每次都从第一步开始，还没写保存检查点的代码
+    start = 0
+
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
 
 # # 测试代码
