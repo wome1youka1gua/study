@@ -109,18 +109,15 @@ class NeRFNetwork(nn.Module):
     def forward(self, x):
         """
         前向传播
-        :param x: 像素坐标和视角
+        :param x: 像素坐标和视角 [N_dots, 63 + 27]
         :return:
         """
-        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_view], dim=-1)  # TODO 我觉得这个x应该就是一个一维张量，所以dim为0也没问题，原来的代码是-1
-        print('input_pts.shape', input_pts.shape)
-        print('input_views.shape', input_views.shape)
+        input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_view], dim=-1)  # [N_dots, 63] [N_dots, 27]
 
         hide_output = input_pts
         for i, linear in enumerate(self.pts_linears):
             hide_output = linear(hide_output)
             hide_output = F.relu(hide_output)
-            print('number', i, ' hide_output.shape', hide_output.shape)
 
             if i in self.skip:
                 hide_output = torch.cat([input_pts, hide_output], dim=-1)
@@ -177,25 +174,19 @@ def run_network(pts, view_dirs, model, embed_fn, embeddirs_fn, net_chunk=32 * 32
     # 获得编码后的坐标
     input_pts_flat = rearrange(pts, 'n n1 d -> (n n1) d', d=3)  # [N_rand * N_samples, 3]
     embedded_pts = embed_fn(input_pts_flat)  # [N_rand * N_samples, 63]
-    print('embedded_pts.shape', embedded_pts.shape)
-    print('embedded_pts[0].shape', embedded_pts[0].shape)
 
     # 获得编码后的视角
     input_view_dirs = rearrange(view_dirs, 'n d -> n 1 d', d=3)
     input_view_dirs_flat = repeat(input_view_dirs, 'n n1 d -> n (repeat n1) d', repeat=pts.shape[1], d=3)  # [N_rand, N_samples, 3]
     input_view_dirs_flat = rearrange(input_view_dirs_flat, 'n n1 d -> (n n1) d', d=3)
     embedded_dirs = embeddirs_fn(input_view_dirs_flat)  # [N_rand * N_samples, 27]
-    print('embedded_dirs.shape', embedded_dirs.shape)
-    print('embedded_dirs[0].shape', embedded_dirs[0].shape)
 
     # 编码后的坐标和视角
     embedded = torch.cat([embedded_pts, embedded_dirs], -1)  # [N_rand * N_samples, 63 + 27]
 
-    # 用网络获取输出
+    # 用网络获取每一个编码后的采样点坐标的预测值
     rgba_flat = batchify(model=model, chunk=net_chunk, inputs=embedded)
-    rgba = torch.reshape(rgba_flat, list(pts.shape[:-1]) + [rgba_flat.shape[-1]])
-    # TODO 这俩好像是一样的
-    print('rgba_flat.shape, rgba.shape', rgba_flat.shape, rgba.shape)
+    rgba = rearrange(rgba_flat, '(n n1) d -> n n1 d', n=pts.shape[0], n1=pts.shape[1], d=4)  # [N_rand, N_samples, 3]
 
     return rgba
 

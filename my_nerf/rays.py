@@ -37,6 +37,9 @@ def get_rays_np(H, W, K, c2w):
     return rays_o, rays_d
 
 
+def raw2outputs(raw, )
+
+
 def render_rays(ray_batch,  # 光线
                 N_samples, perturb,  # 从粗光线上获取采样点需要的参数 粗采样点个数 采样点位置扰动
                 model, network_query_fn,  # 计算
@@ -89,8 +92,11 @@ def render_rays(ray_batch,  # 光线
     pts = rays_o_expand + z_vals_expand * rays_d_expand  # [N_rand, N_samples, 3]
     # 到此位置已经获得采样光线了，该放到网络里预测了
 
+    # 获得渲染出来的颜色
     # 把光线和视角放到网络里，获取预测的结果[rgb, a]
     raw = network_query_fn(pts, view_dirs, model)
+    print(raw.shape)
+    # 用体渲染方程获得颜色
 
 
 def batchify_rays(rays, chunk=32 * 32 * 4 * 8, **kwargs):
@@ -122,10 +128,8 @@ def render(H, W, K, chunk=32 * 32 * 4 * 8, rays=None, near=0., far=1., **kwargs)
     :return:
     """
     rays_o, rays_d = rays  # 获取光线 [N_rand, 3]
-    print('rays_o_in_render', rays_o.shape)
-    print('rays_d_in_render', rays_d.shape)
 
-    # 获取视角 并转为float [N_rand, 3]
+    # 获取视角 并转为float
     view_dirs = rays_d
     view_dirs = view_dirs / torch.norm(view_dirs, dim=-1, keepdim=True)  # torch.norm是求范数 这个式子就是把view_dirs正则化到0-1之间 并且保持维数不变 让每个像素都有对应的视角
     view_dirs = view_dirs.float()  # [N_rand, 3]
@@ -141,7 +145,6 @@ def render(H, W, K, chunk=32 * 32 * 4 * 8, rays=None, near=0., far=1., **kwargs)
 
     # 拼接成完整的光线
     rays_full = torch.cat([rays_o, rays_d, near, far, view_dirs], -1)  # 拼接到一起 [N_rand, 3+3+1+1+3]
-    print('rays_full.shape', rays_full.shape)
 
     # 开始渲染并格式化
     batchify_rays(rays=rays_full, chunk=chunk, **kwargs)

@@ -56,20 +56,20 @@ def config_parser():
     parser.add_argument("--netwidth_fine", type=int, default=256,  # 精细网络每一层神经元的个数
                         help='channels per layer in fine network')
 
-    parser.add_argument("--N_rand", type=int, default=32 * 32 * 2,  # 一轮训练中训练的光线（像素点）的数量，太大了可能会爆显存，可以调
-                        help='一轮训练中训练的光线（像素点）的数量')
-
     parser.add_argument("--N_samples", type=int, default=64,  # 每条射线的粗样本数
                         help='每条粗采样光线上的采样点数量')
 
     parser.add_argument("--N_importance", type=int, default=192,  # 每条射线附加的细样本数 密度大的地方多采几个点
                         help='每条射线附加的细样本数')
 
+    parser.add_argument("--N_rand", type=int, default=32 * 32 * 2,  # 一轮训练中训练的光线（像素点）的数量，太大了可能会爆显存，可以调
+                        help='一轮训练中训练的光线（像素点）的数量')
+
+    parser.add_argument("--chunk", type=int, default=32 * 32 * 2,  # 一批处理的光线数量 其实这个得听N_rand的
+                        help='一批处理的光线数量')
+
     parser.add_argument("--netchunk", type=int, default=32 * 32 * 4,  # 一次向网络里塞这么多点
                         help='网络中并行发送的点数，如果溢出则减少')
-
-    parser.add_argument("--chunk", type=int, default=32 * 32 * 4 * 8,  # 一批处理的光线数量
-                        help='一批处理的光线数量')
 
     parser.add_argument("--lrate", type=float, default=5e-4,  # 学习率
                         help='学习率')
@@ -131,19 +131,14 @@ def train():
 
     # step 获取训练需要的数据
     rays = np.stack([get_rays_np(H, W, K, p) for p in all_poses[:, 0: 3, 0: 4]], 0)  # [N, rays_o+rays_d(2), W, H, 3] 就是每张图片的每个像素的ro和rd，三维向量 最后一维3就是具体的向量
-    print('rays', rays.shape)
 
     all_images_rearrange = rearrange(all_images, 'n h w c -> n 1 h w c', c=3)  # 把图片改成这种形状，最后一维3就是颜色，就能和rays拼起来了
-    print('all_images', all_images_rearrange.shape)
 
     rays_rgb = np.concatenate([rays, all_images_rearrange], 1)  # [N, ro+rd+rgb(3), H, W, 3] 把光线的原点、方向、以及这条光线对应的像素颜色结合到一起
-    print('rays_rgb', rays_rgb.shape)
-    rays_rgb = rearrange(rays_rgb, 'n c2 h w c -> n h w c2 c', c=3)  # 这个顺序才比较符合逻辑
-    rays_rgb_train = np.stack([rays_rgb[i] for i in i_train], 0)  # 只取出训练用的数据
-    print('rays_rgb_train', rays_rgb_train.shape)
-    rays_rgb_train = rearrange(rays_rgb_train, 'n h w c2 c -> (n h w) c2 c')  # 因为要使用批处理，所以需要的是每个像素点的数据，而不是每张图片的数据，把rays_rgb以像素点为单位分开
-    print('rays_rgb_train', rays_rgb_train.shape)
-    rays_rgb_train = rays_rgb_train.astype(np.float32)
+    rays_rgb = rearrange(rays_rgb, 'n c2 h w c -> n h w c2 c', c=3)  # [N, H, W, ro+rd+rgb(3), 3]  这个顺序才比较符合逻辑
+    rays_rgb_train = np.stack([rays_rgb[i] for i in i_train], 0)  # # [N_train, H, W, ro+rd+rgb(3), 3] 只取出训练用的数据
+    rays_rgb_train = rearrange(rays_rgb_train, 'n h w c2 c -> (n h w) c2 c')  # [N_train * H * W, ro+rd+rgb(3), 3] 因为要使用批处理，所以需要的是每个像素点的数据，而不是每张图片的数据，把rays_rgb以像素点为单位分开
+    rays_rgb_train = rays_rgb_train.astype(np.float32)  # [N_train * H * W, ro+rd+rgb(3), 3]
     np.random.shuffle(rays_rgb_train)  # 打乱顺序
 
     # # 把数据放到GPU(CPU)上
@@ -151,8 +146,7 @@ def train():
     all_poses = torch.Tensor(all_poses).to(device)
     rays_rgb_train = torch.Tensor(rays_rgb_train).to(device)
 
-    print('rays_rgb_train_on_cuda', rays_rgb_train.shape)
-
+    print('rays_rgb_train_on_cuda训练的总光线数量为：', rays_rgb_train.shape[0])
     # 至此，已经获取到了每个像素点的光心向量和方向向量以及对应的颜色，可以开始训练了
 
     # 设置训练轮数
@@ -178,12 +172,10 @@ def train():
     # step开始训练
     for i in trange(0, 1):
         time_start = time.time()  # 统计每轮时间
-
-        print('rays_rgb_train_in_train', rays_rgb_train.shape)
+        print('开始第{}轮训练，开始时间为{}'.format(i, time_start))
 
         # step 加载光线和真实的颜色
         batch = rays_rgb_train[i_batch: i_batch + N_rand]  # 取出一批光线 [N_rand, rp+rd+rgb(3), 3]
-        print('batch', batch.shape)
         batch = rearrange(batch, 'n c2 c -> c2 n c', c=3)  # 把第0维和第1维换一下 [ro+rd+rgb, N_rand, 3] 这样就变成了 [每一个像素的ro, 每一个像素的rd, 每一个像素的rgb]
         batch_rays = batch[0: 2]  # 这里面存的是ro 和 rd [ro+rd, N_rand, 3]
         target_color = batch[2]  # 这里面存的是rgb [rgb, N_rand, 3]
