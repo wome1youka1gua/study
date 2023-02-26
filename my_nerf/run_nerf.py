@@ -59,7 +59,7 @@ def config_parser():
     parser.add_argument("--N_samples", type=int, default=64,  # 每条射线的粗样本数
                         help='每条粗采样光线上的采样点数量')
 
-    parser.add_argument("--N_importance", type=int, default=192,  # 每条射线附加的细样本数 密度大的地方多采几个点
+    parser.add_argument("--N_importance", type=int, default=0,  # 每条射线附加的细样本数 密度大的地方多采几个点
                         help='每条射线附加的细样本数')
 
     parser.add_argument("--N_rand", type=int, default=32 * 32 * 2,  # 一轮训练中训练的光线（像素点）的数量，太大了可能会爆显存，可以调

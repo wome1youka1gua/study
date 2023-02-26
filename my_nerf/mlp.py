@@ -133,9 +133,9 @@ class NeRFNetwork(nn.Module):
         rgb = self.rgb_linear(hide_output)  # 计算颜色
 
         # 把颜色和密度拼起来作为输出
-        outputs = torch.cat([rgb, sigma], -1)
+        rgba = torch.cat([rgb, sigma], -1)
 
-        return outputs
+        return rgba
 
     # 初始化权重
     def init_parameters(self):

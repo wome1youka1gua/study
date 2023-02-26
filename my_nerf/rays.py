@@ -10,6 +10,7 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from einops import rearrange, reduce, repeat
 
@@ -37,7 +38,102 @@ def get_rays_np(H, W, K, c2w):
     return rays_o, rays_d
 
 
-def raw2outputs(raw, )
+def sample_pdf(z_vals_mid, transmittance, N_samples,  det=False, pytest=False):
+    """
+
+    :param z_vals_mid:
+    :param transmittance: [N_rand, N_samples]
+    :param N_samples:
+    :param det:
+    :param pytest:
+    :return:
+    """
+    transmittance = transmittance + 1e-5   # prevent nans
+
+    pdf = transmittance / torch.sum(transmittance, -1)  # [N_rand, N_samples] 求transmittance的概率密度函数
+    print('pdf.shape', pdf.shape)
+    cdf = torch.cumsum(pdf, -1)  # [N_rand, N_samples] 分布函数 求导就是transmittance变化率
+    zeros_for_cdf = torch.zeros_like(cdf[:, 0: 1])
+    cdf = torch.cat([zeros_for_cdf, cdf], -1)  # [N_rand, N_samples + 1] 在分布函数前面补个0，分布函数第一位变化率是0，所以得补0
+
+    if not det:
+        u = torch.rand(list(cdf.shape[0: 1]) + [N_samples])  # [N_rand, N_samples]
+    u = u.contiguous()  # 让u的内存连续
+
+
+
+
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+    """
+
+    :param raw: [N_rand, N_samples, 4]
+    :param z_vals: [N_rand, N_samples] 范围是2到6
+    :param rays_d: [N_rand, 3]
+    :param raw_noise_std:
+    :param white_bkgd:
+    :param pytest:
+    :return:
+    """
+    # 通过密度求透明度 alpha_i = 1 - e^-(sigma_i * delta_i)
+    raw2alpha = lambda sigma, dists, act_fn=F.relu: 1. - torch.exp(-act_fn(sigma) * dists)  # 为了避免sigma预测出负数 用relu处理一下
+
+    # 两点之间的距离
+    dists = z_vals[:, 1:] - z_vals[:, :-1]  # [N_rand, N_samples - 1]
+
+    dist_infi = torch.Tensor([1e10])  # 这个项目里无限远的距离是1^10
+    dist_infi = rearrange(dist_infi, 'n -> 1 n')
+    dist_infi = repeat(dist_infi, 'n n1 -> (repeat n) n1', repeat=dists.shape[0])  # [N_rand, 1]
+
+    dists = torch.cat([dists, dist_infi], -1)  # [N_rand, N_samples]
+
+    # 采样的时候没有乘光线方向的长度，而渲染的时候乘了 应该是因为 渲染出来的结果说是人眼看到的，实际上就是相机看到的，就像ue和blender里一样，所以渲染的时候为了模拟看起来的情况，其实就是要模拟相机看到的情况，而相机的视角是一个等腰三角形，腰长肯定比中垂线长
+    # 所以要乘一下，才能转化为真实世界中的距离。采样的时候没乘，应该是因为不需要，采样的时候只需要知道每一个点的颜色就行，而不是在相机中一个方向的颜色，实际上采样里的z_vals和渲染的z_vals的点不是一组点，关系不大，采样的目的就是要得出这一条光线上的所有的点
+    # 的颜色，而渲染的时候只需要这条光线上的一部分点的颜色
+    rays_d_for_norm = rearrange(rays_d, 'n d -> n 1 d', d=3)  # [N_rand, 1, 3] 不扩一维下面求范数的时候会少一维，不好乘了，不管先扩还是后扩都得扩
+    rays_d_norm = torch.norm(rays_d_for_norm, dim=-1)  # [N_rand, 1]
+    dists = dists * rays_d_norm  # [N_rand, N_samples] 每个点到下一个点的距离 delta_i
+
+    # 从raw中取出颜色
+    rgb = torch.sigmoid(raw[:, :, 0: 3])  # [N_rand, N_samples, 3] TODO 这使用sigmoid是为了激活还是规制？ 我感觉好像是激活 因为反向传播的时候算误差用的是已经归一化的颜色作为目标颜色 这里应该不需要在归一了 但是为什么还需要激活呢？
+
+    # 给要渲染的点的密度添加扰动
+    noise = 0.
+    if raw_noise_std > 0.:
+        noise = torch.randn(raw[:, :, 3].shape) * raw_noise_std  # [N_rand, N_samples]
+        print('noise.shape', noise.shape)
+
+    # 计算alpha
+    sigma = raw[:, :, 3] + noise  # [N_rand, N_samples]
+    alpha = raw2alpha(sigma=sigma, dists=dists)  # [N_rand, N_samples]
+    print('alpha.shape', alpha.shape)
+
+    # 计算transmittance
+    # torch.cumprod [1, (1 - a1), (1 - a1)(1 - a2), ... , (1 - a1)(1 - a2)...(1 - an-1)]
+    ones_for_cumprod = torch.ones((alpha.shape[0], 1))  # [N_rand, 1]
+    alpha_for_cumprod = torch.cat([ones_for_cumprod, 1. - alpha + 1e-10], -1)  # [N_rand, N_samples + 1] [N_rand 个 [1, a1, a2, ..., aN_samples]] 最后加一个1e-10是为了防止乘积为0，所以加一个比较小的正数，不会太影响结果
+    alpha_cumprod = torch.cumprod(alpha_for_cumprod, -1)  # [N_rand, N_samples + 1]
+    transmittance = alpha * alpha_cumprod[:, :-1]  # [N_rand, N_samples] [a1, a2(1 - a1), a3(1 - a1)(1 - a2), ... , an(1 - a1)(1 - a2)...(1 - aN_samples-1)]
+
+    # 根据MLP预测出来的颜色和transmittance就可以用体渲染公式算出来相机看到的颜色了
+    transmittance_rearrange = rearrange(transmittance, 'n n1 -> n n1 1')
+    transmittance_expand = repeat(transmittance_rearrange, 'n n1 d -> n n1 (repeat d)', repeat=3, d=1)  # [N_rand, N_samples, 3]
+    rgb_map = torch.sum(rgb * transmittance_expand, -2)  # [N_rand, 3] 就是把每一条光线上面采样点的颜色计算结果加一起，算出了这个方向看过去的颜色 TODO 这个好像也可以用einops替代 AI葵(2) 1:28:54
+
+    # 算相机看过去的这个点和相机之间的距离应该是多少 计算方法和颜色一样 只不过把颜色c换成距离z
+    depth_map = torch.sum(z_vals * transmittance, -1)  # [N_rand]
+
+    # TODO 这个好像没啥用 不知道是啥 不过估计这个在输出预测的模型obj的时候才需要
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(transmittance, -1))
+
+    # 告诉你这个点是不是透明的
+    acc_map = torch.sum(transmittance, -1)  # [N_rand]
+
+    # 把最后渲染的图片弄成白色背景
+    if white_bkgd:
+        acc_map_expand = rearrange(acc_map, 'n -> n 1')
+        rgb_map = rgb_map + (1. - acc_map_expand)
+
+    return rgb_map, disp_map, acc_map, transmittance, depth_map
 
 
 def render_rays(ray_batch,  # 光线
@@ -60,9 +156,7 @@ def render_rays(ray_batch,  # 光线
 
     # 放置采样点
     t_vals = torch.linspace(0., 1., steps=N_samples)  # o+td中的t
-    print('t_vals', t_vals.shape)
-    z_vals = 1 / ((1. / near) * (1. - t_vals) + (1. / far) * t_vals)  # [N_N_rand, N_samples] 范围也是2-6 但是是非线性变化的 sample linearly in inverse depth 看函数图像，这样采样的话距离原点越近采样点越密集，应该距离原点越近采样效果就越好，可能相当于给距离近的点加权重了
-    print('z_vals', z_vals.shape)
+    z_vals = 1 / ((1. / near) * (1. - t_vals) + (1. / far) * t_vals)  # [N_rand, N_samples] 是2-6 但是是非线性变化的 sample linearly in inverse depth 看函数图像，这样采样的话距离原点越近采样点越密集，应该距离原点越近采样效果就越好，可能相当于给距离近的点加权重了
 
     # 给采样点添加扰动 让每个采样点的位置在一个小邻域内浮动
     if perturb > 0.:
@@ -93,10 +187,19 @@ def render_rays(ray_batch,  # 光线
     # 到此位置已经获得采样光线了，该放到网络里预测了
 
     # 获得渲染出来的颜色
-    # 把光线和视角放到网络里，获取预测的结果[rgb, a]
-    raw = network_query_fn(pts, view_dirs, model)
-    print(raw.shape)
+    # 把所有点的坐标和视角放到网络里，获取预测的结果[rgb, a]
+    raw = network_query_fn(pts, view_dirs, model)  # [N_rand, N_samples, 4]
     # 用体渲染方程获得颜色
+    rgb_map, disp_map, acc_map, transmittance, depth_map = raw2outputs(raw=raw, z_vals=z_vals, rays_d=rays_d, raw_noise_std=raw_noise_std, white_bkgd=white_bkgd, pytest=pytest)
+
+    # TODO 先跳过吧 这有点难
+    # 如果N_importance大于0，就对weight变化率更大（相当于密度更大）的那个区域进行采样
+    if N_importance > 0.:
+        rgb_map0, disp_map0, acc_map0 = rgb_map, disp_map, acc_map
+
+        z_vals_mids = 0.5 * (z_vals[:, : -1] + z_vals[:, 1:])  # [N_rand, N_samples-1] 每两个点的中间位置
+
+    # TODO 2023-2-26 15:06 该ret了
 
 
 def batchify_rays(rays, chunk=32 * 32 * 4 * 8, **kwargs):
