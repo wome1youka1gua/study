@@ -242,7 +242,7 @@ def create_nerf(device, args):
     # 每次都从第一步开始，还没写保存检查点的代码
     start = 0
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+    return render_kwargs_train, render_kwargs_test, start, model, grad_vars, optimizer
 
 
 # # 测试代码

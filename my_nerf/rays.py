@@ -7,7 +7,10 @@
 @Author  ：王子安
 @Date    ：2023/2/22 16:46 
 """
+import os
+import time
 
+import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,6 +19,9 @@ from einops import rearrange, reduce, repeat
 
 
 # 首先需要一个获取相机原点到图片中每个像素的光线方向的函数 o+td 获取这个o和d
+from tqdm import tqdm
+
+
 def get_rays_np(H, W, K, c2w):
     """
     获得一张图片中每一个像素对应的视角和光心
@@ -123,7 +129,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     depth_map = torch.sum(z_vals * transmittance, -1)  # [N_rand]
 
     # TODO 这个好像没啥用 不知道是啥 不过估计这个在输出预测的模型obj的时候才需要
-    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(transmittance, -1))
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(transmittance, -1))  # [N_rand]
 
     # 告诉你这个点是不是透明的
     acc_map = torch.sum(transmittance, -1)  # [N_rand]
@@ -199,7 +205,13 @@ def render_rays(ray_batch,  # 光线
 
         z_vals_mids = 0.5 * (z_vals[:, : -1] + z_vals[:, 1:])  # [N_rand, N_samples-1] 每两个点的中间位置
 
-    # TODO 2023-2-26 15:06 该ret了
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+
+    # TODO 到时候弄一下
+    if N_importance > 0:
+        pass
+
+    return ret
 
 
 def batchify_rays(rays, chunk=32 * 32 * 4 * 8, **kwargs):
@@ -213,7 +225,15 @@ def batchify_rays(rays, chunk=32 * 32 * 4 * 8, **kwargs):
     all_ret = dict()
     for i in range(0, rays.shape[0], chunk):
         print('正在处理第', i, '批光线')
-        render_rays(rays[i: i + chunk], **kwargs)
+        ret = render_rays(rays[i: i + chunk], **kwargs)
+        for k in ret:
+            if k not in all_ret:
+                all_ret[k] = list()
+            all_ret[k].append(ret[k])
+
+    all_ret = {k: torch.cat(all_ret[k], 0) for k in all_ret}   # {rgb_map: [N_rand, 3], disp_map: [N_rand], acc_map: [N_rand]}
+
+    return all_ret
 
 
 # 调用这个函数的时候，near 和 far在字典里，但是定义这个函数的时候，不在字典里，这样可以方便本函数调用，省的再从字典里拿，这个写法不错，可以参考
@@ -250,7 +270,18 @@ def render(H, W, K, chunk=32 * 32 * 4 * 8, rays=None, near=0., far=1., **kwargs)
     rays_full = torch.cat([rays_o, rays_d, near, far, view_dirs], -1)  # 拼接到一起 [N_rand, 3+3+1+1+3]
 
     # 开始渲染并格式化
-    batchify_rays(rays=rays_full, chunk=chunk, **kwargs)
+    all_ret = batchify_rays(rays=rays_full, chunk=chunk, **kwargs)  # {rgb_map: [N_rand, 3], disp_map: [N_rand], acc_map: [N_rand]}  这里面都是tensor
+    sh = rays_d.shape
+    for k in all_ret:
+        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
+        all_ret[k] = torch.reshape(all_ret[k], k_sh)
+
+    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    ret_list = [all_ret[k] for k in k_extract]  # len == 3
+    ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}  # 这些参数暂时用不到
+
+    return ret_list + [ret_dict]
+
 
 
 

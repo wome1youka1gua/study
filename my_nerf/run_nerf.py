@@ -7,12 +7,15 @@
 @Author  ：王子安
 @Date    ：2023/2/21 9:42 
 """
+import os
+
 import configargparse  # 这个库用来读取配置文件
+import imageio
 import numpy as np
 import time
 import torch
 
-from mlp import create_nerf
+from mlp import create_nerf, NeRFNetwork
 from load import load_blender_data
 from rays import get_rays_np, render
 from tqdm import tqdm, trange
@@ -81,6 +84,9 @@ def config_parser():
                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
 
     parser.add_argument("--perturb", type=float, default=1.,  # 采样光线上的采样点是否要抖动
+                        help='采样光线上的采样点是否要抖动')
+
+    parser.add_argument("--model_save_path", type=str, default='./model/model.pt',  # 采样光线上的采样点是否要抖动
                         help='采样光线上的采样点是否要抖动')
 
 
@@ -158,7 +164,7 @@ def train():
 
     # 创建NeRF网络模型
     # 1.训练要的东西 包括网络和扰动等参数 2.测试要的东西 3.检查点，练到第几轮了 4.模型中的可训练参数 5.可训练参数的优化器
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(device, args)
+    render_kwargs_train, render_kwargs_test, start, model, grad_vars, optimizer = create_nerf(device, args)
     global_step = start
 
     # 再把渲染距离区间添加到训练和测试要的东西里
@@ -178,7 +184,7 @@ def train():
         batch = rays_rgb_train[i_batch: i_batch + N_rand]  # 取出一批光线 [N_rand, rp+rd+rgb(3), 3]
         batch = rearrange(batch, 'n c2 c -> c2 n c', c=3)  # 把第0维和第1维换一下 [ro+rd+rgb, N_rand, 3] 这样就变成了 [每一个像素的ro, 每一个像素的rd, 每一个像素的rgb]
         batch_rays = batch[0: 2]  # 这里面存的是ro 和 rd [ro+rd, N_rand, 3]
-        target_color = batch[2]  # 这里面存的是rgb [rgb, N_rand, 3]
+        target_color = batch[2]  # 这里面存的是rgb [N_rand, 3]
 
         i_batch += N_rand
         if i_batch >= rays_rgb_train.shape[0]:
@@ -188,17 +194,40 @@ def train():
             rays_rgb_train = rays_rgb_train[rand_index]
             i_batch = 0
 
-        # 把光线送到模型中预测
-        render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
+        # 把光线送到模型中预测 rgb[N_rand, 3]
+        rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays, **render_kwargs_train)
 
+        # 计算损失
+        img2mse = lambda x, y: torch.mean((x - y) ** 2)  # 均方误差
+        mse2psnr = lambda x: -10. * torch.log(x) / torch.log(torch.Tensor([10.]))  # 峰值信噪比
 
+        optimizer.zero_grad()  # 先清空梯度 防止梯度爆炸或消失
+        loss_mse = img2mse(rgb, target_color)
+        loss_psnr = mse2psnr(loss_mse)
 
+        # 反向传播
+        loss_psnr.backward()
 
+        # 更新网络参数
+        optimizer.step()
 
+        # 更新学习率
+        decay_rate = 0.1
+        decay_steps = args.lrate_decay * 1000
+        new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lrate
 
+        # TODO render_path 2023-2-26 21:56
 
+    # 保存模型
+    torch.save(model, args.model_save_path)
 
+    # 加载模型
+    model = torch.load(args.model_save_path)
+    model.eval()
 
+    render_kwargs_test['model'] = model
 
 
 train()
